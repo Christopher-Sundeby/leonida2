@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,7 @@
 #include <vector>
 
 #include "console_heap_fix_spv.h"
+#include "queue_families.h"
 #include "vulkan_aftermath.h"
 #include "vulkan_memory.h"
 
@@ -350,14 +352,19 @@ public:
     };
     enum TableKind : unsigned { range_table, backed_table, ask_table, change_shader_table, change_title_table, table_count };
 
+    static constexpr std::uint32_t kDefaultLog2Keys = 20;
+
+    // `families`: the device's distinct queue families. The pass is a prelude of every queue's submissions (direct and
+    // async compute), so its buffers are shared across them (share_across_queue_families), as the other device-wide
+    // pools are.
     ConsoleHeapGpu(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
-                   std::uint32_t log2_keys = 20)
-        : get_(get), device_(device), memory_(memory), keys_(log2_keys) {}
+                   std::uint32_t log2_keys = kDefaultLog2Keys, std::vector<std::uint32_t> families = {})
+        : get_(get), device_(device), memory_(memory), families_(std::move(families)), keys_(log2_keys) {}
     ~ConsoleHeapGpu() {
         std::lock_guard lock(mutex_);
         for (auto& pass : in_flight_) free_buffer(pass.buffer);
         for (Heap& h : heaps_) free_buffer(h.meta);
-        for (auto& b : retired_) free_buffer(b);
+        for (auto& r : retired_) free_buffer(r.buffer);
         for (auto& buffer : pool_) free_buffer(buffer);
         for (Table& t : tables_) {
             for (auto& [version, buffer] : t.old) free_buffer(buffer);
@@ -404,7 +411,8 @@ public:
     void remove_heap(int heap) {
         std::lock_guard lock(mutex_);
         if (heap < 0 || unsigned(heap) >= kMaxHeaps) return;
-        if (heaps_[heap].meta.buffer) retired_.push_back(heaps_[heap].meta);  // a pass in flight may still write it
+        // A pass recorded so far may still write the metadata: it is freed by drain() once none of them is in flight.
+        if (heaps_[heap].meta.buffer) retired_.push_back({heaps_[heap].meta, passes_recorded_});
         heaps_[heap] = Heap{};
     }
 
@@ -517,6 +525,7 @@ public:
         const VkDeviceSize bytes = VkDeviceSize(kMissHeader + kMissCapacity) * 4 + VkDeviceSize(work) * 4 +
                                    VkDeviceSize(updates.size()) * 4 + 64;
         Pass pass{};
+        pass.serial = ++passes_recorded_;
         if (!acquire_buffer(bytes, pass.buffer)) {
             for (std::size_t i = 0; i < updates.size(); i += ConsoleHeapKeys::kUpdateWords) keys_.touch(updates[i]);
             return false;
@@ -766,6 +775,15 @@ public:
                 done.push_back(std::move(*it));
                 it = in_flight_.erase(it);
             }
+            // A removed heap's metadata, once every pass recorded before the removal is done or was never submitted
+            // (commit(false) takes it off the list): a pass recorded after it no longer names that heap.
+            std::uint64_t oldest_pass = std::numeric_limits<std::uint64_t>::max();
+            for (const Pass& pass : in_flight_) oldest_pass = std::min(oldest_pass, pass.serial);
+            std::erase_if(retired_, [&](Retired& r) {
+                if (r.last_pass >= oldest_pass) return false;
+                free_buffer(r.buffer);
+                return true;
+            });
             // Tables no pass in flight still reads go back to their pool.
             for (unsigned kind = 0; kind < table_count; ++kind) {
                 Table& t = tables_[kind];
@@ -800,6 +818,11 @@ public:
     std::size_t in_flight() {
         std::lock_guard lock(mutex_);
         return in_flight_.size();
+    }
+    // Removed heaps' metadata buffers not freed yet (a pass recorded before the removal is still in flight).
+    std::size_t retired() {
+        std::lock_guard lock(mutex_);
+        return retired_.size();
     }
     // A pass recorded and not yet committed: its command buffer is on its way to the queue.
     bool uncommitted() {
@@ -850,6 +873,11 @@ private:
         std::vector<std::uint32_t> updates;
         bool cleared = false, committed = false;
         std::uint64_t ticket = 0;
+        std::uint64_t serial = 0;  // the order record() made it in (passes_recorded_)
+    };
+    struct Retired {
+        Buffer buffer;
+        std::uint64_t last_pass = 0;  // the newest pass recorded when its heap was removed
     };
     struct Push {
         VkDeviceAddress input_slots, copy_slots, work, ranges, keys, misses, backed, ask, meta, cshader, ctitle;
@@ -936,6 +964,7 @@ private:
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        share_across_queue_families(info, families_);
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device_, out.buffer, &requirements);
@@ -1037,6 +1066,7 @@ private:
     PFN_vkGetDeviceProcAddr get_;
     VkDevice device_;
     VkPhysicalDeviceMemoryProperties memory_;
+    std::vector<std::uint32_t> families_;  // share_across_queue_families
     std::mutex mutex_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
@@ -1051,7 +1081,8 @@ private:
     std::vector<Copy> copies_;
     std::vector<std::shared_ptr<void>> keeps_;
     ConsoleHeapSpans change_shader_, change_title_;  // pending rescan_filtered() spans
-    std::vector<Buffer> retired_;                    // removed heaps' metadata
+    std::vector<Retired> retired_;                   // removed heaps' metadata, until drain() frees it
+    std::uint64_t passes_recorded_ = 0;
     Stats stats_;
 };
 

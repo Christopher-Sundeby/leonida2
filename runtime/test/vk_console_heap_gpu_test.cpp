@@ -553,6 +553,30 @@ int main() {
     }
     std::puts("console heap pass, miss list overflow: ok");
     {
+        // A removed heap's metadata buffer is freed by the drain() after the last pass recorded before the removal,
+        // not kept until the object goes (RT-CONSOLE-HEAP-GPU-SHARING-AND-RETIRE).
+        const auto nothing = [](int, std::uint32_t, std::uint32_t) {};
+        const auto no_overflow = [](int) {};
+        EXPECT(gpu.retired() == 5);  // the five views just removed, with no pass in flight
+        gpu.drain(5, nothing, no_overflow);
+        EXPECT(gpu.retired() == 0);
+        const int extra = gpu.add_heap(d.device_address(input), d.device_address(copy), kSlots);
+        EXPECT(extra >= 0);
+        const std::vector<std::uint32_t> few{0, 1, 2};
+        gpu.queue(extra, few.begin(), few.end());
+        bool recorded = false;
+        EXPECT(d.run([&](VkCommandBuffer cb) { return recorded = gpu.record(cb); }));
+        EXPECT(recorded);
+        gpu.remove_heap(extra);  // the pass just recorded may still write its metadata
+        EXPECT(gpu.retired() == 1);
+        gpu.commit(true, 6);
+        gpu.drain(5, nothing, no_overflow);  // ticket 6 not reached: the pass and the buffer stay
+        EXPECT(gpu.in_flight() == 1 && gpu.retired() == 1);
+        gpu.drain(6, nothing, no_overflow);
+        EXPECT(gpu.in_flight() == 0 && gpu.retired() == 0);
+    }
+    std::puts("console heap pass, a removed heap's metadata is freed once its passes are done: ok");
+    {
         // Clustered words (bases a megabyte apart) entered in both tables: every slot answered, none missed.
         Case clustered;
         for (std::uint32_t s2 = 0; s2 < 3000; ++s2) {

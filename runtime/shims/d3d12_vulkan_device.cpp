@@ -5687,7 +5687,8 @@ struct DeviceState {
 
     void setup_console_heap_gpu(PFN_vkGetDeviceProcAddr get_device) {
         if ((!console_heap_gpu_enabled() && !shadow_gpu_enabled()) || !context || !get_device) return;
-        auto gpu = std::make_unique<leonida::ConsoleHeapGpu>(get_device, info.device, memory);
+        auto gpu = std::make_unique<leonida::ConsoleHeapGpu>(get_device, info.device, memory,
+                                                             leonida::ConsoleHeapGpu::kDefaultLog2Keys, families);
         if (!gpu->init()) {
             std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU: the translation pass could not be made; the "
                                  "console heaps are fixed on the CPU\n");
