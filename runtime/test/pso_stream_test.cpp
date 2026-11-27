@@ -47,6 +47,7 @@ std::size_t payload_of_type(const std::vector<unsigned char>& s, unsigned wanted
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) { size = sizeof(D3D12_DEPTH_STENCIL_DESC1); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) { size = 8; align = 8; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) { size = sizeof(D3D12_INPUT_LAYOUT_DESC); align = 8; }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) { size = sizeof(D3D12_STREAM_OUTPUT_DESC); align = 8; }
         const std::size_t pay = align_up(off + 4, align);
         if (type == wanted) return pay;
         off = align_up(pay + size, 8);
@@ -137,6 +138,45 @@ void test_capture_and_deep_copy() {
                 sizeof(il));
     check(il.NumElements == 1 && std::strcmp(il.pInputElementDescs[0].SemanticName, kSemantic) == 0,
           "input layout semantic names are copied");
+}
+
+void test_stream_output_names_copied() {
+    // A stream-output declaration whose names live in the caller's buffers, as a temporary string would: the copy
+    // keeps its own names after the caller's are overwritten (RT-PSO-STREAM-SO-SEMANTIC-COPY).
+    char name0[] = "SV_POSITION";
+    char name1[] = "TEXCOORD";
+    D3D12_SO_DECLARATION_ENTRY entries[3] = {};
+    entries[0] = {0, name0, 0, 0, 4, 0};
+    entries[1] = {0, name1, 1, 0, 2, 0};
+    entries[2] = {0, nullptr, 0, 0, 2, 0};  // a gap: no name
+    UINT strides[1] = {40};
+    D3D12_STREAM_OUTPUT_DESC so{entries, 3, strides, 1, 0};
+    StreamBuilder s;
+    ID3D12RootSignature* root = nullptr;
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, 8, 8);
+    D3D12_SHADER_BYTECODE vs{kVsCode, sizeof(kVsCode)};
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs, sizeof(vs), 8);
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, &so, sizeof(so), 8);
+    auto rec = rt::d3d12_xs::PsoStreamRecord::capture({s.bytes.size(), s.bytes.data()});
+    check(rec != nullptr, "a stream with a stream-output declaration is captured");
+    if (!rec) return;
+
+    std::memset(name0, 'X', sizeof(name0) - 1);
+    std::memset(name1, 'X', sizeof(name1) - 1);
+    entries[0].SemanticName = entries[1].SemanticName = "OVERWRITTEN";
+    D3D12_STREAM_OUTPUT_DESC copy{};
+    std::memcpy(&copy, rec->bytes().data() + payload_of_type(rec->bytes(), D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT),
+                sizeof(copy));
+    check(copy.NumEntries == 3 && copy.pSODeclaration != entries, "the stream-output entries are copied");
+    if (copy.NumEntries != 3 || !copy.pSODeclaration) return;
+    const D3D12_SO_DECLARATION_ENTRY* e = copy.pSODeclaration;
+    check(e[0].SemanticName && e[0].SemanticName != name0 && std::strcmp(e[0].SemanticName, "SV_POSITION") == 0 &&
+              e[1].SemanticName && e[1].SemanticName != name1 && std::strcmp(e[1].SemanticName, "TEXCOORD") == 0,
+          "stream-output semantic names are copied, not referenced");
+    check(e[2].SemanticName == nullptr && e[1].SemanticIndex == 1 && e[0].ComponentCount == 4,
+          "a nameless entry stays nameless and the other fields are kept");
+    check(copy.NumStrides == 1 && copy.pBufferStrides != strides && copy.pBufferStrides[0] == 40,
+          "the buffer strides are copied");
 }
 
 void test_derive_single_and_all_tags() {
@@ -260,6 +300,7 @@ int main() {
     std::printf("pso_stream_test: derived pipeline state streams\n");
     test_layout_matches_console_offsets();
     test_capture_and_deep_copy();
+    test_stream_output_names_copied();
     test_derive_single_and_all_tags();
     test_stencil_mask_record();
     test_refusals();

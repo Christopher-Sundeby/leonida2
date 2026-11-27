@@ -311,9 +311,18 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: {
             D3D12_STREAM_OUTPUT_DESC so{};
             std::memcpy(&so, payload, sizeof(so));
-            if (so.pSODeclaration && so.NumEntries)
-                so.pSODeclaration = reinterpret_cast<const D3D12_SO_DECLARATION_ENTRY*>(
-                    own_blob(payloads_->blobs, so.pSODeclaration, so.NumEntries * sizeof(D3D12_SO_DECLARATION_ENTRY)));
+            if (so.pSODeclaration && so.NumEntries) {
+                auto* entries = reinterpret_cast<D3D12_SO_DECLARATION_ENTRY*>(const_cast<unsigned char*>(
+                    own_blob(payloads_->blobs, so.pSODeclaration, so.NumEntries * sizeof(D3D12_SO_DECLARATION_ENTRY))));
+                // The names too, as for INPUT_LAYOUT: the caller's strings need not outlive its call.
+                for (UINT i = 0; i < so.NumEntries; ++i) {
+                    if (!entries[i].SemanticName) continue;
+                    const std::size_t len = std::strlen(entries[i].SemanticName) + 1;
+                    entries[i].SemanticName =
+                        reinterpret_cast<const char*>(own_blob(payloads_->blobs, entries[i].SemanticName, len));
+                }
+                so.pSODeclaration = entries;
+            }
             if (so.pBufferStrides && so.NumStrides)
                 so.pBufferStrides = reinterpret_cast<const UINT*>(
                     own_blob(payloads_->blobs, so.pBufferStrides, so.NumStrides * sizeof(UINT)));
